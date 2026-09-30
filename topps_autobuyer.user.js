@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Topps Auto Buyer
 // @namespace    https://www.topps.com/
-// @version      2.2
-// @description  Monitor & auto-buy products on topps.com — background stock checker via Shopify API, floating UI, card vault & iframe auto-filler
+// @version      2.5
+// @description  Monitor & auto-buy products on topps.com — background stock checker via Shopify API, floating UI, card vault & iframe auto-filler (v2.5: expiry execCommand fix, cursor repositioning, React reversion detection)
 // @author       Pythonic Shariful
 // @match        https://www.topps.com/*
 // @match        https://shop.topps.com/*
@@ -31,6 +31,7 @@
   const STORAGE_KEY_CARD_EXP_YY   = 'topps_card_exp_yy';
   const STORAGE_KEY_CARD_CVV       = 'topps_card_cvv';
   const STORAGE_KEY_CARD_NAME      = 'topps_card_name';
+  const STORAGE_KEY_CARD_PHONE     = 'topps_card_phone';
   const STORAGE_KEY_CARD_BLUR      = 'topps_card_blurred';
   const STORAGE_KEY_DISCOUNT       = 'topps_discount_code';
   const STORAGE_KEY_STATUS_LOG     = 'topps_status_log';
@@ -453,41 +454,153 @@
     if (typeof input.blur === 'function') input.blur();
   }
 
-  // Shopify expiry behavior (Shopify PCI iframe, React-controlled masked input):
-  //   The field `input#expiry` (autocomplete="cc-exp") expects the FULL formatted
-  //   string "MM / YY" (with space-slash-space separator).  It does NOT reliably
-  //   auto-insert "/" on its own when driven by execCommand/synthetic events.
-  //   Strategy: clear the field, then type every character of "MM / YY" one by
-  //   one — including the spaces and slash — via execCommand('insertText').
+  // Shopify expiry behavior — 3-strategy waterfall (v2.5):
+  //
+  //  WHY native-setter fails: React controlled inputs re-render from internal
+  //  fiber state ~async after the input event fires, reverting our native
+  //  setter value.  We need React's OWN onChange pipeline to run.
+  //
+  //  Strategy 1 (primary): document.execCommand('insertText') fires a real
+  //    InputEvent (inputType:'insertText') that React's synthetic event
+  //    delegation picks up and commits to fiber state — no async reversion.
+  //
+  //  Strategy 2 (clipboard): ClipboardEvent 'paste' with DataTransfer, which
+  //    Shopify's onPaste handler processes and commits to React state.
+  //
+  //  Strategy 3 (digit-by-digit): type raw month digits, wait 300 ms for
+  //    Shopify's mask to auto-insert ' / ' and move cursor, then explicitly
+  //    reposition cursor via setSelectionRange before typing year digits.
+  //    This prevents year digits landing at wrong cursor position.
+  //
+  //  After EACH strategy, we sleep 300 ms (not 150 ms) to catch React async
+  //  reversion before declaring success.
   async function humanTypeExpiry(input, mm, yy) {
     if (!input || !mm || !yy) return;
 
-    // Normalise to exactly 2-digit strings
     const m = mm.toString().padStart(2, '0').slice(-2);
     const y = yy.toString().slice(-2); // accept "2026" → "26"
+    const fullExpiry = `${m} / ${y}`; // e.g. "11 / 27"
 
-    // Full string the field expects: "MM / YY"
-    const fullExpiry = `${m} / ${y}`;
+    // verify 4+ digits are present after React may re-render
+    const isOk = () => (input.value || '').replace(/\D/g, '').length >= 4;
 
+    const selectAllDelete = async () => {
+      _ensureFocus(input);
+      await sleep(40);
+      if (typeof input.select === 'function') input.select();
+      try { document.execCommand('selectAll', false); } catch {}
+      await sleep(30);
+      try { document.execCommand('delete', false); } catch {}
+      await sleep(60);
+    };
+
+    // ═══ Strategy 1: execCommand('insertText') ════════════════════════════════
+    // Fires a real InputEvent that React's synthetic event system commits to
+    // fiber state — prevents async reversion unlike native property setter.
     input.focus();
     await sleep(100);
+    await selectAllDelete();
+    _ensureFocus(input);
+    try { document.execCommand('insertText', false, fullExpiry); } catch {}
+    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    // Use longer wait to catch any async React reversion
+    await sleep(300);
 
-    // ── Clear existing value cleanly ──
-    _setVal(input, '');
-    if (typeof input.select === 'function') input.select();
-    try { document.execCommand('selectAll', false); } catch {}
-    try { document.execCommand('delete', false); } catch {}
-    await sleep(60);
+    if (isOk()) {
+      log('✅ Expiry filled via execCommand (Strategy 1)');
+      if (typeof input.blur === 'function') input.blur();
+      return;
+    }
 
-    // ── Type every character including " / " ──
-    for (const char of fullExpiry) {
+    // ═══ Strategy 2: native setter + InputEvent ═══════════════════════════════
+    // Bypass React wrapper and fire a synthetic input event.
+    await selectAllDelete();
+    _setVal(input, fullExpiry);
+    // Also fire a proper InputEvent (not just Event) — React checks inputType
+    try {
+      input.dispatchEvent(new InputEvent('input', {
+        inputType: 'insertText',
+        data: fullExpiry,
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+      }));
+    } catch {
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    }
+    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    await sleep(300);
+
+    if (isOk()) {
+      log('✅ Expiry filled via native setter (Strategy 2)');
+      if (typeof input.blur === 'function') input.blur();
+      return;
+    }
+
+    // ═══ Strategy 3: clipboard paste via DataTransfer ═════════════════════════
+    await selectAllDelete();
+    _ensureFocus(input);
+    try {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', fullExpiry);
+      input.dispatchEvent(new ClipboardEvent('paste', {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      }));
+    } catch {}
+    await sleep(300);
+
+    if (isOk()) {
+      log('✅ Expiry filled via clipboard paste (Strategy 3)');
+      if (typeof input.blur === 'function') input.blur();
+      return;
+    }
+
+    // ═══ Strategy 4: digit-by-digit with cursor repositioning ═════════════════
+    // After typing MM, Shopify auto-inserts ' / ' and moves cursor.
+    // We wait 300 ms then explicitly move cursor to end before typing YY.
+    await selectAllDelete();
+    _ensureFocus(input);
+
+    // Type month digits
+    for (const char of m) {
       _ensureFocus(input);
       await typeSingleChar(input, char);
-      await sleep(55 + Math.random() * 45);
+      await sleep(120);
+    }
+
+    // Wait for Shopify mask to auto-insert " / "
+    await sleep(350);
+
+    // Explicitly move cursor to the END of the field
+    // so year digits land after the auto-inserted separator
+    const lenAfterMask = (input.value || '').length;
+    try { input.setSelectionRange(lenAfterMask, lenAfterMask); } catch {}
+    _ensureFocus(input);
+
+    // Type year digits
+    for (const char of y) {
+      _ensureFocus(input);
+      await typeSingleChar(input, char);
+      await sleep(120);
     }
 
     input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-    await sleep(80);
+    await sleep(300);
+
+    if (isOk()) {
+      log('✅ Expiry filled via digit-by-digit (Strategy 4)');
+    } else {
+      // Absolute last resort — force value, accept React may revert it
+      log('⚠ All expiry strategies failed — forcing native value…');
+      _setVal(input, fullExpiry);
+      input.dispatchEvent(new Event('input',  { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      await sleep(200);
+    }
+
     if (typeof input.blur === 'function') input.blur();
   }
 
@@ -586,7 +699,20 @@
         if (isTyping) return;
         isTyping = true;
         try {
-          await humanType(nameInput, value);
+          // Use forcePaste to set the full name in one shot (prevents char-drop)
+          await forcePaste(nameInput, value);
+          await sleep(80);
+          const filled = (nameInput.value || '').trim();
+          const maxLen = nameInput.maxLength > 0 ? nameInput.maxLength : Infinity;
+          if (filled.toLowerCase() !== value.toLowerCase()) {
+            if (filled.length >= maxLen) {
+              // Field accepted all it can — maxlength cap from Shopify, not a script bug
+              // notifyParent anyway so the flow continues
+            } else {
+              // Paste was rejected by React; fall back to humanType
+              await humanType(nameInput, value);
+            }
+          }
           notifyParent('Name on Card', requestId);
           handled = true;
         } finally {
@@ -1142,6 +1268,11 @@
               <input id="tbot-card-name" class="tbot-input" type="text"
                 placeholder="Full name" value="${get(STORAGE_KEY_CARD_NAME, '')}">
             </div>
+            <div>
+              <div class="tbot-label">Phone Number <span style="font-size:9px;color:#94a3b8;font-weight:400">(Required by Shopify)</span></div>
+              <input id="tbot-card-phone" class="tbot-input" type="tel"
+                placeholder="e.g. +14015551234" value="${get(STORAGE_KEY_CARD_PHONE, '')}">
+            </div>
           </div>
 
           <div class="tbot-btn-row">
@@ -1256,6 +1387,7 @@
       const expYy    = document.getElementById('tbot-card-exp-yy').value.trim();
       const cvv      = document.getElementById('tbot-card-cvv').value.trim();
       const name     = document.getElementById('tbot-card-name').value.trim();
+      const phone    = document.getElementById('tbot-card-phone') ? document.getElementById('tbot-card-phone').value.trim() : '';
       const discount = document.getElementById('tbot-discount-code').value.trim();
 
       set(STORAGE_KEY_CARD_NUM,    num);
@@ -1263,6 +1395,7 @@
       set(STORAGE_KEY_CARD_EXP_YY, expYy);
       set(STORAGE_KEY_CARD_CVV,    cvv);
       set(STORAGE_KEY_CARD_NAME,   name);
+      set(STORAGE_KEY_CARD_PHONE,  phone);
       set(STORAGE_KEY_DISCOUNT,    discount);
       set(STORAGE_KEY_CARD_BLUR,   true);
 
@@ -1621,13 +1754,16 @@
     }
 
     // 4. Name on Card
+    //    FIX (v2.3): Use forcePaste for the name field in the iframe first
+    //    to avoid the character-drop bug caused by early blur in humanType.
+    //    Fall back to top-level page selector if the iframe paste fails.
     if (cardName) {
-      log('✍ Typing Name on card in iframe…');
+      log('✍ Filling Name on card…');
       const ok = await sendFieldToIframes('name', cardName);
       if (ok) {
         log('✅ Name on Card filled successfully in iframe!');
       } else {
-        // Fallback: try top-level page
+        // Fallback: try top-level page selectors using forcePaste
         const topNameSelectors = [
           'input[name="name"][type="text"]:not(.visually-hidden)',
           'input[placeholder*="Name on card" i]',
@@ -1646,8 +1782,13 @@
           }
         }
         if (topName) {
-          log('✍ Typing Name on card (fallback)…');
+          log('✍ Pasting Name on card (fallback)…');
           await forcePaste(topName, cardName);
+          // Verify full name was accepted
+          if ((topName.value || '').trim().toLowerCase() !== cardName.toLowerCase()) {
+            // Try humanType if paste was rejected
+            await humanType(topName, cardName);
+          }
           log('✅ Name on Card filled successfully!');
         } else {
           log('⚠ Name on Card field not found anywhere.');
@@ -1725,9 +1866,10 @@
           const txt = el.textContent.trim();
           if (txt && el.offsetParent !== null) {
             const lowerTxt = txt.toLowerCase();
-            
-            // If it's just telling us to enter a *valid* card, we ignore it (fake card testing)
-            if (lowerTxt.includes('enter a valid')) continue;
+
+            // FIX (v2.3): Only ignore "enter a valid card number" errors (fake test cards).
+            // DO NOT ignore "enter a valid expiration date" — that is a real blocking error.
+            if (lowerTxt === 'enter a valid card number') continue;
 
             // If it says exactly "enter a card number", the field is missing/cleared
             if (lowerTxt === 'enter a card number' || lowerTxt.includes('card number is incomplete')) {
@@ -2004,6 +2146,30 @@
       // Step 1: Apply discount code first (if any)
       await sleep(1000); // let the page settle
       await applyDiscountCode();
+
+      // Step 1b: Fill phone number if missing (FIX v2.3)
+      const savedPhone = get(STORAGE_KEY_CARD_PHONE, '').trim();
+      if (savedPhone) {
+        await sleep(300);
+        const phoneSelectors = [
+          'input[name="phone"]',
+          'input[id="phone"]',
+          'input[autocomplete="tel"]',
+          'input[type="tel"]'
+        ];
+        for (const sel of phoneSelectors) {
+          const phoneEl = document.querySelector(sel);
+          if (phoneEl && phoneEl.offsetParent !== null) {
+            const currentPhone = (phoneEl.value || '').trim();
+            if (!currentPhone) {
+              log('📞 Filling phone number…');
+              await forcePaste(phoneEl, savedPhone);
+              log('✅ Phone number filled!');
+            }
+            break;
+          }
+        }
+      }
 
       // Step 2: Wait for payment iframe then fill card
       log('⏳ Waiting for credit card fields…');
